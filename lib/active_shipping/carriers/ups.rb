@@ -439,6 +439,19 @@ module ActiveShipping
           build_address_artifact_format_location(xml, 'TransitFrom', origin)
           build_address_artifact_format_location(xml, 'TransitTo', destination)
 
+          xml.ShipmentWeight do
+            xml.UnitOfMeasurement do
+              xml.Code(options[:imperial] ? 'LBS' : 'KGS')
+            end
+
+            value = packages.inject(0) do |sum, package|
+              sum + (options[:imperial] ? package.lbs.to_f : package.kgs.to_f )
+            end
+            value = (value * 1000).round/1000.0
+
+            xml.Weight([value, 0.1].max)
+          end
+
           xml.InvoiceLineTotal do
             xml.CurrencyCode('USD')
             total_value = packages.inject(0) {|sum, package| sum + package.value}
