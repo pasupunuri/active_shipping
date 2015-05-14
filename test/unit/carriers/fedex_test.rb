@@ -15,19 +15,31 @@ class FedExTest < Minitest::Test
   end
 
   def test_business_days
-    today = DateTime.civil(2013, 3, 12, 0, 0, 0, "-4")
+    today = DateTime.civil(2013, 3, 12, 0, 0, 0, "-4") #Tuesday
 
     Timecop.freeze(today) do
       assert_equal DateTime.civil(2013, 3, 13, 0, 0, 0, "-4"), @carrier.send(:business_days_from, today, 1)
       assert_equal DateTime.civil(2013, 3, 15, 0, 0, 0, "-4"), @carrier.send(:business_days_from, today, 3)
+      assert_equal DateTime.civil(2013, 3, 18, 0, 0, 0, "-4"), @carrier.send(:business_days_from, today, 4)
       assert_equal DateTime.civil(2013, 3, 19, 0, 0, 0, "-4"), @carrier.send(:business_days_from, today, 5)
+    end
+  end
+
+  def test_home_delivery_business_days
+    today = DateTime.civil(2013, 3, 12, 0, 0, 0, "-4") #Tuesday
+
+    Timecop.freeze(today) do
+      assert_equal DateTime.civil(2013, 3, 13, 0, 0, 0, "-4"), @carrier.send(:business_days_from, today, 1, true)
+      assert_equal DateTime.civil(2013, 3, 15, 0, 0, 0, "-4"), @carrier.send(:business_days_from, today, 3, true)
+      assert_equal DateTime.civil(2013, 3, 16, 0, 0, 0, "-4"), @carrier.send(:business_days_from, today, 4, true)
+      assert_equal DateTime.civil(2013, 3, 19, 0, 0, 0, "-4"), @carrier.send(:business_days_from, today, 5, true)
     end
   end
 
   def test_turn_around_time_default
     mock_response = xml_fixture('fedex/ottawa_to_beverly_hills_rate_response').gsub('<v6:DeliveryTimestamp>2011-07-29</v6:DeliveryTimestamp>', '')
 
-    today = DateTime.civil(2013, 3, 11, 0, 0, 0, "-4")
+    today = DateTime.civil(2013, 3, 11, 0, 0, 0, "-4") #Monday
 
     Timecop.freeze(today) do
       delivery_date = Date.today + 7.days # FIVE_DAYS in fixture response, plus weekend
