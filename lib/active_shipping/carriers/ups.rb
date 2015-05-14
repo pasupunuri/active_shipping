@@ -134,7 +134,7 @@ module ActiveShipping
     end
 
     def find_tracking_info(tracking_number, options = {})
-      options = @options.update(options)
+      options = @options.merge(options)
       access_request = build_access_request
       tracking_request = build_tracking_request(tracking_number, options)
       response = commit(:track, save_request(access_request + tracking_request), options[:test])
