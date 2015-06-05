@@ -483,4 +483,11 @@ class UPSTest < Minitest::Test
       assert delivery_estimate.service_name, UPS::DEFAULT_SERVICES[delivery_estimate.service_code]
     end
   end
+
+  def test_void_shipment
+    mock_response = xml_fixture("ups/void_shipment_response")
+    @carrier.expects(:commit).returns(mock_response)
+    response = @carrier.void_shipment('1Z12345E0390817264')
+    assert response
+  end
 end
