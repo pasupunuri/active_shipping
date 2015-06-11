@@ -16,7 +16,8 @@ module ActiveShipping
       :track => 'ups.app/xml/Track',
       :ship_confirm => 'ups.app/xml/ShipConfirm',
       :ship_accept => 'ups.app/xml/ShipAccept',
-      :delivery_dates =>  'ups.app/xml/TimeInTransit'
+      :delivery_dates =>  'ups.app/xml/TimeInTransit',
+      :void =>  'ups.app/xml/Void'
     }
 
     PICKUP_CODES = HashWithIndifferentAccess.new(
@@ -189,6 +190,14 @@ module ActiveShipping
       dates_request = build_delivery_dates_request(origin, destination, packages, pickup_date, options)
       response = commit(:delivery_dates, save_request(access_request + dates_request), (options[:test] || false))
       parse_delivery_dates_response(origin, destination, packages, response, options)
+    end
+
+    def void_shipment(tracking, options={})
+      options = @options.merge(options)
+      access_request = build_access_request
+      void_request = build_void_request(tracking)
+      response = commit(:void, save_request(access_request + void_request), (options[:test] || false))
+      parse_void_response(response, options)
     end
 
     protected
@@ -462,6 +471,18 @@ module ActiveShipping
         end
       end
 
+      xml_builder.to_xml
+    end
+
+    def build_void_request(tracking)
+      xml_builder = Nokogiri::XML::Builder.new do |xml|
+        xml.VoidShipmentRequest do
+          xml.Request do
+            xml.RequestAction('Void')
+          end
+          xml.ShipmentIdentificationNumber(tracking)
+        end
+      end
       xml_builder.to_xml
     end
 
@@ -788,6 +809,17 @@ module ActiveShipping
         end
       end
       response = DeliveryDateEstimatesResponse.new(success, message, Hash.from_xml(response).values.first, :delivery_estimates => delivery_estimates, :xml => response, :request => last_request)
+    end
+
+    def parse_void_response(response, options={})
+      xml = build_document(response, 'VoidShipmentResponse')
+      success = response_success?(xml)
+      message = response_message(xml)
+      if success
+        true
+      else
+        raise ResponseError.new("Void shipment failed with message: #{message}")
+      end
     end
 
     def location_from_address_node(address)
