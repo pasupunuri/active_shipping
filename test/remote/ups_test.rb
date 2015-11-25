@@ -295,4 +295,43 @@ class RemoteUPSTest < Minitest::Test
       assert_equal(e.message, "Void shipment failed with message: Failure: Time for voiding has expired.")
     end
   end
+
+  def test_obtain_return_label
+    response = @carrier.create_shipment(
+      location_fixtures[:beverly_hills_with_name],
+      location_fixtures[:real_google_as_commercial],
+      #package descriptions are required for returns
+      package_fixtures.values_at(:books),
+      {
+        :shipper => location_fixtures[:new_york],
+        :return_service_code => '9',
+        :test => true
+      }
+    )
+
+    assert response.success?
+
+    assert_instance_of ActiveShipping::LabelResponse, response
+  end
+
+  def test_obtain_international_return_label
+    response = @carrier.create_shipment(
+      location_fixtures[:ottawa_with_name],
+      #international return requires destination to have: phone number, name
+      location_fixtures[:real_google_with_name_phone],
+      #package descriptions are required for returns
+      package_fixtures.values_at(:books),
+      {
+        #international return requires shipper to have: phone, name
+        :shipper => location_fixtures[:new_york_with_name],
+        :service_code => '07',
+        :return_service_code => '9',
+        :test => true,
+      }
+    )
+
+    assert response.success?
+
+    assert_instance_of ActiveShipping::LabelResponse, response
+  end
 end
