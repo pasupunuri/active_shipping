@@ -524,8 +524,6 @@ class FedExTest < Minitest::Test
     end
   end
 
-<<<<<<< HEAD
-=======
   def test_tracking_info_with_uncovered_error
     mock_response = xml_fixture('fedex/tracking_response_invalid_tracking_number')
     @carrier.expects(:commit).returns(mock_response)

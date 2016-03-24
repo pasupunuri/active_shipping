@@ -544,7 +544,7 @@ module ActiveShipping
       tracking_number = xml.css("CompletedPackageDetails TrackingIds TrackingNumber").text
       base_64_image = xml.css("Label Image").text
 
-      labels = [Label.new(tracking_number, base_64_image)]
+      labels = [Label.new(tracking_number, Base64.decode64(base_64_image))]
       LabelResponse.new(success, message, response_info, {labels: labels})
     end
 

@@ -516,8 +516,6 @@ class UPSTest < Minitest::Test
     end
   end
 
-<<<<<<< HEAD
-=======
   def test_get_rates_for_single_serivce
     mock_response = xml_fixture("ups/rate_single_service")
     @carrier.expects(:commit).returns(mock_response)
