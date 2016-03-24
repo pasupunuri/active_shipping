@@ -10,11 +10,8 @@ module ActiveShipping
   # This will send a test request to the USPS test servers, which they ask you
   # to do before they put your API key in production mode.
   class USPS < Carrier
-    EventDetails = Struct.new(:description, :time, :zoneless_time, :location)
-    EVENT_MESSAGE_PATTERNS = [
-      /^(.*), (\w+ \d{1,2}, \d{4}, \d{1,2}:\d\d [ap]m), (.*), (\w\w) (\d{5})$/i,
-      /^Your item \w{2,3} (out for delivery|delivered).* at (\d{1,2}:\d\d [ap]m on \w+ \d{1,2}, \d{4}) in (.*), (\w\w) (\d{5})\.$/i
-    ]
+    EventDetails = Struct.new(:description, :time, :zoneless_time, :location, :event_code)
+    ONLY_PREFIX_EVENTS = ['DELIVERED','OUT FOR DELIVERY']
     self.retry_safe = true
 
     cattr_reader :name
@@ -25,10 +22,8 @@ module ActiveShipping
 
     TEST_DOMAINS = { # indexed by security; e.g. TEST_DOMAINS[USE_SSL[:rates]]
       true => 'secure.shippingapis.com',
-      false => 'testing.shippingapis.com'
+      false => 'stg-production.shippingapis.com'
     }
-
-    TEST_RESOURCE = 'ShippingAPITest.dll'
 
     API_CODES = {
       :us_rates => 'RateV4',
@@ -157,10 +152,12 @@ module ActiveShipping
       "WS" => "Western Samoa"
     }
 
-    STATUS_NODE_PATTERNS = %w(
-      Error/Description
-      */TrackInfo/Error/Description
-    )
+    TRACKING_ODD_COUNTRY_NAMES = {
+      'TAIWAN' => 'TW',
+      'MACEDONIA THE FORMER YUGOSLAV REPUBLIC OF'=> 'MK',
+      'MICRONESIA FEDERATED STATES OF' => 'FM',
+      'MOLDOVA REPUBLIC OF' => 'MD',
+    }
 
     RESPONSE_ERROR_MESSAGES = [
       /There is no record of that mail item/,
@@ -177,7 +174,14 @@ module ActiveShipping
       options = @options.merge(options)
       tracking_request = build_tracking_request(tracking_number, options)
       response = commit(:track, tracking_request, options[:test] || false)
-      parse_tracking_response(response, options)
+      parse_tracking_response(response).first
+    end
+
+    def batch_find_tracking_info(tracking_infos, options = {})
+      options = @options.update(options)
+      tracking_request = build_tracking_batch_request(tracking_infos, options)
+      response = commit(:track, tracking_request, options[:test] || false)
+      parse_tracking_response(response, fault_tolerant: true)
     end
 
     def self.size_code_for(package)
@@ -232,26 +236,67 @@ module ActiveShipping
       Mass.new(70, :pounds)
     end
 
-    def extract_event_details(message)
-      return EventDetails.new unless EVENT_MESSAGE_PATTERNS.any? { |pattern| message =~ pattern }
-      description = $1.upcase
-      timestamp = $2
-      city = $3
-      state = $4
-      zip_code = $5
+    def extract_event_details(node)
+      description = node.at('Event').text.upcase
 
-      time = Time.parse(timestamp)
+      if prefix = ONLY_PREFIX_EVENTS.find { |p| description.start_with?(p) }
+        description = prefix
+      end
+
+      time = if node.at('EventDate').text.present?
+        timestamp = "#{node.at('EventDate').text}, #{node.at('EventTime').text}"
+        Time.parse(timestamp)
+      else
+        # Arbitrary time in past, because we need to sort properly by time
+        Time.parse("Jan 01, 2000")
+      end
+
+      event_code = node.at('EventCode').text
+      city = node.at('EventCity').try(:text)
+      state = node.at('EventState').try(:text)
+      zip_code = node.at('EventZIPCode').try(:text)
+
+      country_node = node.at('EventCountry')
+      country = country_node ? country_node.text : ''
+      country = 'UNITED STATES' if country.empty?
+      # USPS returns upcased country names which ActiveUtils doesn't recognize without translation
+      country = find_country_code_case_insensitive(country)
+
       zoneless_time = Time.utc(time.year, time.month, time.mday, time.hour, time.min, time.sec)
-      location = Location.new(city: city, state: state, postal_code: zip_code, country: 'USA')
-      EventDetails.new(description, time, zoneless_time, location)
+      location = Location.new(city: city, state: state, postal_code: zip_code, country: country)
+      EventDetails.new(description, time, zoneless_time, location, event_code)
+    end
+
+    def maximum_address_field_length
+      # https://www.usps.com/business/web-tools-apis/address-information-api.pdf
+      38
     end
 
     protected
 
     def build_tracking_request(tracking_number, options = {})
+      build_tracking_batch_request([{
+        number: tracking_number,
+        destination_zip: options[:destination_zip],
+        mailing_date: options[:mailing_date]
+      }], options)
+    end
+
+    def build_tracking_batch_request(tracking_infos, options)
       xml_builder = Nokogiri::XML::Builder.new do |xml|
-        xml.TrackRequest('USERID' => @options[:login]) do
-          xml.TrackID('ID' => tracking_number)
+        xml.TrackFieldRequest('USERID' => options[:login]) do
+          xml.Revision { xml.text('1') }
+          xml.ClientIp { xml.text(options[:client_ip] || '127.0.0.1') }
+          xml.SourceId { xml.text(options[:source_id] || 'active_shipping') }
+          tracking_infos.each do |info|
+            xml.TrackID('ID' => info[:number]) do
+              xml.DestinationZipCode { xml.text(strip_zip(info[:destination_zip]))} if info[:destination_zip]
+              if info[:mailing_date]
+                formatted_date = info[:mailing_date].strftime('%Y-%m-%d')
+                xml.MailingDate { xml.text(formatted_date)}
+              end
+            end
+          end
         end
       end
       xml_builder.to_xml
@@ -264,7 +309,7 @@ module ActiveShipping
     end
 
     def world_rates(origin, destination, packages, options = {})
-      request = build_world_rate_request(packages, destination, options)
+      request = build_world_rate_request(origin, packages, destination, options)
       # never use test mode; rate requests just won't work on test servers
       parse_rate_response(origin, destination, packages, commit(:world_rates, request, false), options)
     end
@@ -316,8 +361,11 @@ module ActiveShipping
               xml.ZipDestination(strip_zip(destination_zip))
               xml.Pounds(0)
               xml.Ounces("%0.1f" % [package.ounces, 1].max)
-              xml.Container(CONTAINERS[package.options[:container]])
-              xml.Size(USPS.size_code_for(package))
+              size_code = USPS.size_code_for(package)
+              container = CONTAINERS[package.options[:container]]
+              container ||= (package.cylinder? ? 'NONRECTANGULAR' : 'RECTANGULAR') if size_code == 'LARGE'
+              xml.Container(container)
+              xml.Size(size_code)
               xml.Width("%0.2f" % package.inches(:width))
               xml.Length("%0.2f" % package.inches(:length))
               xml.Height("%0.2f" % package.inches(:height))
@@ -344,10 +392,11 @@ module ActiveShipping
     #
     # package.options[:mail_type] -- one of [:package, :postcard, :matter_for_the_blind, :envelope].
     #                                 Defaults to :package.
-    def build_world_rate_request(packages, destination, options)
+    def build_world_rate_request(origin, packages, destination, options)
       country = COUNTRY_NAME_CONVERSIONS[destination.country.code(:alpha2).value] || destination.country.name
       xml_builder = Nokogiri::XML::Builder.new do |xml|
         xml.IntlRateV2Request('USERID' => @options[:login]) do
+          xml.Revision(2)
           Array(packages).each_with_index do |package, id|
             xml.Package('ID' => id) do
               xml.Pounds(0)
@@ -372,8 +421,13 @@ module ActiveShipping
               xml.Length("%0.2f" % [package.inches(:length), 0.01].max)
               xml.Height("%0.2f" % [package.inches(:height), 0.01].max)
               xml.Girth("%0.2f" % [package.inches(:girth), 0.01].max)
+              xml.OriginZip(origin.zip)
               if commercial_type = commercial_type(options)
                 xml.public_send(COMMERCIAL_FLAG_NAME.fetch(commercial_type), 'Y')
+              end
+              if destination.zip.present?
+                xml.AcceptanceDateTime((options[:acceptance_time] || Time.now.utc).iso8601)
+                xml.DestinationPostalCode(destination.zip)
               end
             end
           end
@@ -389,7 +443,7 @@ module ActiveShipping
 
       xml = Nokogiri.XML(response)
 
-      if error = xml.at('/Error')
+      if error = xml.at_xpath('/Error | //ServiceErrors/ServiceError')
         success = false
         message = error.at('Description').text
       else
@@ -526,35 +580,58 @@ module ActiveShipping
                   package.inches(:length) + package.inches(:width) + package.inches(:height)))
     end
 
-    def parse_tracking_response(response, options)
-      actual_delivery_date, status = nil
+    def parse_tracking_response(response, options = {})
       xml = Nokogiri.XML(response)
-      root_node = xml.root
 
-      success = response_success?(xml)
-      message = response_message(xml)
+      if has_error?(xml)
+        message = error_description_node(xml).text
+        # actually raises instead of returning by nature of TrackingResponse#initialize
+        return TrackingResponse.new(false, message, Hash.from_xml(response),
+          carrier: @@name, xml: response, request: last_request)
+      end
+
+      # Responses are always returned in the order originally given.
+      if options[:fault_tolerant]
+        xml.root.xpath('TrackInfo').map do |info|
+          # Don't let one failure wreck the whole batch
+          begin
+            parse_tracking_info(response, info)
+          rescue ResponseError => e
+            e.response
+          end
+        end
+      else
+        xml.root.xpath('TrackInfo').map { |info| parse_tracking_info(response, info) }
+      end
+    end
+
+
+    def parse_tracking_info(response, node)
+      success = !has_error?(node)
+      message = response_message(node)
 
       if success
         destination = nil
         shipment_events = []
-        tracking_details = xml.root.xpath('TrackInfo/TrackDetail')
+        tracking_details = node.xpath('TrackDetail')
+        tracking_details << node.at('TrackSummary')
 
-        tracking_summary = xml.root.at('TrackInfo/TrackSummary')
-        if tracking_details.length > 0
-          tracking_details << tracking_summary
-        else
-          success = false
-          message = tracking_summary.text
-        end
-
-        tracking_number = xml.root.at('TrackInfo').attributes['ID'].value
+        tracking_number = node.attributes['ID'].value
+        prediction_node = node.at('PredictedDeliveryDate') || node.at('ExpectedDeliveryDate')
+        scheduled_delivery = prediction_node ? Time.parse(prediction_node.text) : nil
 
         tracking_details.each do |event|
-          details = extract_event_details(event.text)
-          shipment_events << ShipmentEvent.new(details.description, details.zoneless_time, details.location) if details.location
+          details = extract_event_details(event)
+          if details.location
+            shipment_events << ShipmentEvent.new(details.description, details.zoneless_time,
+              details.location, details.description, details.event_code)
+          end
         end
 
         shipment_events = shipment_events.sort_by(&:time)
+
+        # USPS defines a delivery attempt with code 55
+        attempted_delivery_date = shipment_events.detect{ |shipment_event| shipment_event.type_code=="55" }.try(:time)
 
         if last_shipment = shipment_events.last
           status = last_shipment.status
@@ -570,40 +647,36 @@ module ActiveShipping
                            :destination => destination,
                            :tracking_number => tracking_number,
                            :status => status,
-                           :actual_delivery_date => actual_delivery_date
+                           :actual_delivery_date => actual_delivery_date,
+                           :attempted_delivery_date => attempted_delivery_date,
+                           :scheduled_delivery_date => scheduled_delivery
       )
     end
 
-    def track_summary_node(document)
-      document.root.xpath('TrackInfo/TrackSummary')
+    def error_description_node(node)
+      node.xpath('Error/Description')
     end
 
-    def error_description_node(document)
-      STATUS_NODE_PATTERNS.each do |pattern|
-        if node = document.elements[pattern]
-          return node
-        end
-      end
+    def response_status_node(node)
+      node.at('StatusSummary') || error_description_node(node)
     end
 
-    def response_status_node(document)
-       track_summary_node(document) || error_description_node(document)
-    end
-
-    def has_error?(document)
-      !document.at('Error').nil?
-    end
-
-    def tracking_info_error?(document)
-      !document.root.at('TrackInfo/Error').nil?
-    end
-
-    def response_success?(document)
-      !(has_error?(document) || tracking_info_error?(document))
+    def has_error?(node)
+      node.xpath('Error').length > 0
     end
 
     def response_message(document)
       response_status_node(document).text
+    end
+
+    def find_country_code_case_insensitive(name)
+      upcase_name = name.upcase.gsub('  ', ', ')
+      if special = TRACKING_ODD_COUNTRY_NAMES[upcase_name]
+        return special
+      end
+      country = ActiveUtils::Country::COUNTRIES.detect { |c| c[:name].upcase == upcase_name }
+      raise ActiveShipping::Error, "No country found for #{name}" unless country
+      country[:alpha2]
     end
 
     def commit(action, request, test = false)
@@ -613,8 +686,7 @@ module ActiveShipping
     def request_url(action, request, test)
       scheme = USE_SSL[action] ? 'https://' : 'http://'
       host = test ? TEST_DOMAINS[USE_SSL[action]] : LIVE_DOMAIN
-      resource = test ? TEST_RESOURCE : LIVE_RESOURCE
-      "#{scheme}#{host}/#{resource}?API=#{API_CODES[action]}&XML=#{URI.encode(request)}"
+      "#{scheme}#{host}/#{LIVE_RESOURCE}?API=#{API_CODES[action]}&XML=#{URI.encode(request)}"
     end
 
     def strip_zip(zip)

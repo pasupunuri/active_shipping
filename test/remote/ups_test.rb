@@ -218,6 +218,35 @@ class RemoteUPSTest < Minitest::Test
     assert_instance_of ActiveShipping::LabelResponse, response
   end
 
+  def test_obtain_shipping_label_with_bill_third_party
+    begin
+      bill_third_party_credentials = credentials(:ups_third_party_billing)
+    rescue NoCredentialsFound => e
+      skip(e.message)
+    end
+
+    response = @carrier.create_shipment(
+      location_fixtures[:beverly_hills],
+      location_fixtures[:new_york_with_name],
+      package_fixtures.values_at(:books),
+      {
+        :test => true,
+        :bill_third_party => true,
+        :billing_account => bill_third_party_credentials[:account],
+        :billing_zip => bill_third_party_credentials[:zip],
+        :billing_country => bill_third_party_credentials[:country_code]
+      }
+    )
+
+    assert response.success?
+
+    # All behavior specific to how a LabelResponse behaves in the
+    # context of UPS label data is a matter for unit tests.  If
+    # the data changes substantially, the create_shipment
+    # ought to raise an exception and this test will fail.
+    assert_instance_of ActiveShipping::LabelResponse, response
+  end
+
   def test_obtain_international_shipping_label
     response = @carrier.create_shipment(
       location_fixtures[:new_york_with_name],
@@ -239,14 +268,13 @@ class RemoteUPSTest < Minitest::Test
   end
 
   def test_delivery_date_estimates_within_zip
-    monday = Date.parse('0201', '%m%d') # Feb to avoid holidays http://www.ups.com/content/us/en/resources/ship/imp_exp/operation.html
-    monday += 1.day while monday.wday != 1
+    today = Date.current
 
     response = @carrier.get_delivery_date_estimates(
       location_fixtures[:new_york_with_name],
       location_fixtures[:new_york_with_name],
       package_fixtures.values_at(:books),
-      pickup_date=monday,
+      today,
       {
         :test => true
       }
@@ -255,18 +283,36 @@ class RemoteUPSTest < Minitest::Test
     assert response.success?
     refute_empty response.delivery_estimates
     ground_delivery_estimate = response.delivery_estimates.select {|de| de.service_name == "UPS Ground"}.first
-    assert_equal monday + 1.day, ground_delivery_estimate.date
+    assert_equal Date.parse(1.business_days.from_now.to_s), ground_delivery_estimate.date
+  end
+
+  def test_delivery_date_estimates_within_zip_with_no_value
+    today = Date.current
+
+    response = @carrier.get_delivery_date_estimates(
+      location_fixtures[:new_york_with_name],
+      location_fixtures[:new_york_with_name],
+      package_fixtures.values_at(:book),
+      today,
+      {
+        :test => true
+      }
+    )
+
+    assert response.success?
+    refute_empty response.delivery_estimates
+    ground_delivery_estimate = response.delivery_estimates.select {|de| de.service_name == "UPS Ground"}.first
+    assert_equal Date.parse(1.business_days.from_now.to_s), ground_delivery_estimate.date
   end
 
   def test_delivery_date_estimates_across_zips
-    monday = Date.parse('0201', '%m%d') # Feb to avoid holidays http://www.ups.com/content/us/en/resources/ship/imp_exp/operation.html
-    monday += 1.day while monday.wday != 1
+    today = Date.current
 
     response = @carrier.get_delivery_date_estimates(
       location_fixtures[:new_york_with_name],
       location_fixtures[:real_home_as_residential],
       package_fixtures.values_at(:books),
-      pickup_date=monday,
+      today,
       {
         :test => true
       }
@@ -275,9 +321,142 @@ class RemoteUPSTest < Minitest::Test
     assert response.success?
     refute_empty response.delivery_estimates
     ground_delivery_estimate = response.delivery_estimates.select {|de| de.service_name == "UPS Ground"}.first
-    assert_equal monday + 3.day, ground_delivery_estimate.date
+    assert_equal Date.parse(3.business_days.from_now.to_s), ground_delivery_estimate.date
     next_day_delivery_estimate = response.delivery_estimates.select {|de| de.service_name == "UPS Next Day Air"}.first
-    assert_equal monday + 1.day, next_day_delivery_estimate.date
+    assert_equal Date.parse(1.business_days.from_now.to_s), next_day_delivery_estimate.date
+  end
+
+  def test_rate_with_single_service
+    response = @carrier.find_rates(
+      location_fixtures[:new_york_with_name],
+      location_fixtures[:real_home_as_residential],
+      package_fixtures.values_at(:books),
+      {
+        :service => UPS::DEFAULT_SERVICE_NAME_TO_CODE["UPS Ground"],
+        :test => true
+      }
+    )
+
+    assert response.success?
+    refute response.rates.empty?
+    assert_equal ["UPS Ground"], response.rates.map(&:service_name)
+  end
+
+  def test_delivery_date_estimates_intl
+    today = Date.current
+    response = @carrier.get_delivery_date_estimates(
+      location_fixtures[:new_york_with_name],
+      location_fixtures[:ottawa_with_name],
+      package_fixtures.values_at(:books),
+      pickup_date=today,
+      {
+        :test => true
+      }
+    )
+
+    assert response.success?
+    refute_empty response.delivery_estimates
+    ww_express_estimate = response.delivery_estimates.select {|de| de.service_name == "UPS Worldwide Express"}.first
+    assert_equal Date.parse(1.day.from_now.to_s), ww_express_estimate.date
+  end
+
+  def test_void_shipment
+    # this is a test tracking number from the ups docs that always returns sucess
+    response = @carrier.void_shipment('1Z12345E0390817264')
+    assert response
+  end
+
+  def test_void_beyond_time_limit
+    e = assert_raises(ResponseError) do
+      # this is a test tracking number from the ups docs that always returns time limit expired
+      @carrier.void_shipment('1Z12345E8793628675')
+    end
+    assert_equal(e.message, "Void shipment failed with message: Failure: Time for voiding has expired.")
+  end
+
+
+  def test_maximum_address_field_length
+    assert_equal 35, @carrier.maximum_address_field_length
+  end
+
+  def test_obtain_return_label
+    response = @carrier.create_shipment(
+      location_fixtures[:beverly_hills_with_name],
+      location_fixtures[:real_google_as_commercial],
+      #package descriptions are required for returns
+      package_fixtures.values_at(:books),
+      {
+        :shipper => location_fixtures[:new_york],
+        :return_service_code => '9',
+        :test => true
+      }
+    )
+
+    assert response.success?
+
+    assert_instance_of ActiveShipping::LabelResponse, response
+  end
+
+  def test_obtain_international_return_label
+    response = @carrier.create_shipment(
+      location_fixtures[:ottawa_with_name],
+      #international return requires destination to have: phone number, name
+      location_fixtures[:real_google_with_name_phone],
+      #package descriptions are required for returns
+      package_fixtures.values_at(:books),
+      {
+        #international return requires shipper to have: phone, name
+        :shipper => location_fixtures[:new_york_with_name],
+        :service_code => '07',
+        :return_service_code => '9',
+        :test => true,
+      }
+    )
+
+    assert response.success?
+
+    assert_instance_of ActiveShipping::LabelResponse, response
+  end
+
+  def test_obtain_shipping_label_zpl_format
+    response = @carrier.create_shipment(
+      location_fixtures[:beverly_hills],
+      location_fixtures[:new_york_with_name],
+      package_fixtures.values_at(:american_wii),
+      :label_format => "ZPL",
+      :test => true
+    )
+
+    assert response.success?
+    assert_instance_of ActiveShipping::LabelResponse, response
+    assert_equal "ZPL", response.params['ShipmentResults']['PackageResults']['LabelImage']['LabelImageFormat']['Code']
+  end
+
+  def test_obtain_shipping_label_defaults_to_gif_format
+    response = @carrier.create_shipment(
+      location_fixtures[:beverly_hills],
+      location_fixtures[:new_york_with_name],
+      package_fixtures.values_at(:american_wii),
+      :label_format => nil,
+      :test => true
+    )
+
+    assert response.success?
+    assert_instance_of ActiveShipping::LabelResponse, response
+    assert_equal "GIF", response.params['ShipmentResults']['PackageResults']['LabelImage']['LabelImageFormat']['Code']
+  end
+
+  def test_create_shipment_with_dry_ice_options
+    response = @carrier.create_shipment(
+      location_fixtures[:beverly_hills_with_name],
+      location_fixtures[:new_york_with_name],
+      package_fixtures.values_at(:frozen_stuff),
+      :service_code => '01',
+      :test => true
+    )
+
+    assert response.success?
+    assert_instance_of ActiveShipping::LabelResponse, response
   end
 
   def test_void_shipment

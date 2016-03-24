@@ -21,10 +21,7 @@
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #++
 
-require 'active_support'
-require 'active_support/json'
-require 'active_support/core_ext/enumerable'
-require 'active_support/core_ext/class/attribute_accessors'
+require 'active_support/all'
 require 'active_utils'
 
 require 'nokogiri'
@@ -46,3 +43,5 @@ require 'active_shipping/shipment_packer'
 require 'active_shipping/carrier'
 require 'active_shipping/carriers'
 require 'active_shipping/errors'
+require 'active_shipping/external_return_label_request'
+require 'active_shipping/external_return_label_response'

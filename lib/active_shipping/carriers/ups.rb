@@ -3,6 +3,7 @@
 module ActiveShipping
   class UPS < Carrier
     self.retry_safe = true
+    self.ssl_version = :TLSv1_2
 
     cattr_accessor :default_options
     cattr_reader :name
@@ -65,7 +66,11 @@ module ActiveShipping
       "83" => "UPS Today Dedicated Courier",
       "84" => "UPS Today Intercity",
       "85" => "UPS Today Express",
-      "86" => "UPS Today Express Saver"
+      "86" => "UPS Today Express Saver",
+      "92" => "UPS SurePost (USPS) < 1lb",
+      "93" => "UPS SurePost (USPS) > 1lb",
+      "94" => "UPS SurePost (USPS) BPM",
+      "95" => "UPS SurePost (USPS) Media",
     }
 
     CANADA_ORIGIN_SERVICES = {
@@ -128,6 +133,7 @@ module ActiveShipping
     DEFAULT_SERVICE_NAME_TO_CODE['UPS 3 Day Select'] = "12"
     # The time in transit API refers to 'UPS Saver' as 'UPS Worldwide Saver'
     DEFAULT_SERVICE_NAME_TO_CODE['UPS Worldwide Saver'] = "65"
+    DEFAULT_SERVICE_NAME_TO_CODE['UPS Next Day Air Early'] = "14"
 
     SHIPMENT_DELIVERY_CONFIRMATION_CODES = {
       delivery_confirmation_signature_required: 1,
@@ -155,6 +161,15 @@ module ActiveShipping
       parse_rate_response(origin, destination, packages, response, options)
     end
 
+    # Retrieves tracking information for a previous shipment
+    #
+    # @note Override with whatever you need to get a shipping label
+    #
+    # @param tracking_number [String] The unique identifier of the shipment to track.
+    # @param options [Hash] Carrier-specific parameters.
+    # @option options [Boolean] :mail_innovations Set this to true to track a Mail Innovations Package
+    # @return [ActiveShipping::TrackingResponse] The response from the carrier. This
+    #   response should a list of shipment tracking events if successful.
     def find_tracking_info(tracking_number, options = {})
       options = @options.merge(options)
       access_request = build_access_request
@@ -168,39 +183,32 @@ module ActiveShipping
       packages = Array(packages)
       access_request = build_access_request
 
-      begin
+      # STEP 1: Confirm.  Validation step, important for verifying price.
+      confirm_request = build_shipment_request(origin, destination, packages, options)
+      logger.debug(confirm_request) if logger
 
-        # STEP 1: Confirm.  Validation step, important for verifying price.
-        confirm_request = build_shipment_request(origin, destination, packages, options)
-        logger.debug(confirm_request) if logger
+      confirm_response = commit(:ship_confirm, save_request(access_request + confirm_request), (options[:test] || false))
+      logger.debug(confirm_response) if logger
 
-        confirm_response = commit(:ship_confirm, save_request(access_request + confirm_request), (options[:test] || false))
-        logger.debug(confirm_response) if logger
+      # ... now, get the digest, it's needed to get the label.  In theory,
+      # one could make decisions based on the price or some such to avoid
+      # surprises.  This also has *no* error handling yet.
+      xml = parse_ship_confirm(confirm_response)
+      success = response_success?(xml)
+      message = response_message(xml)
+      raise message unless success
+      digest  = response_digest(xml)
 
-        # ... now, get the digest, it's needed to get the label.  In theory,
-        # one could make decisions based on the price or some such to avoid
-        # surprises.  This also has *no* error handling yet.
-        xml = parse_ship_confirm(confirm_response)
-        success = response_success?(xml)
-        message = response_message(xml)
-        raise message unless success
-        digest  = response_digest(xml)
+      # STEP 2: Accept. Use shipment digest in first response to get the actual label.
+      accept_request = build_accept_request(digest, options)
+      logger.debug(accept_request) if logger
 
-        # STEP 2: Accept. Use shipment digest in first response to get the actual label.
-        accept_request = build_accept_request(digest, options)
-        logger.debug(accept_request) if logger
+      accept_response = commit(:ship_accept, save_request(access_request + accept_request), (options[:test] || false))
+      logger.debug(accept_response) if logger
 
-        accept_response = commit(:ship_accept, save_request(access_request + accept_request), (options[:test] || false))
-        logger.debug(accept_response) if logger
-
-        # ...finally, build a map from the response that contains
-        # the label data and tracking information.
-        parse_ship_accept(accept_response)
-
-      rescue RuntimeError => e
-        raise "Could not obtain shipping label. #{e.message}."
-
-      end
+      # ...finally, build a map from the response that contains
+      # the label data and tracking information.
+      parse_ship_accept(accept_response)
     end
 
     def get_delivery_date_estimates(origin, destination, packages, pickup_date=Date.current, options = {})
@@ -219,6 +227,11 @@ module ActiveShipping
       void_request = build_void_request(tracking)
       response = commit(:void, save_request(access_request + void_request), (options[:test] || false))
       parse_void_response(response, options)
+    end
+
+    def maximum_address_field_length
+      # http://www.ups.com/worldshiphelp/WS12/ENU/AppHelp/CONNECT/Shipment_Data_Field_Descriptions.htm
+      35
     end
 
     protected
@@ -251,9 +264,7 @@ module ActiveShipping
         xml.RatingServiceSelectionRequest do
           xml.Request do
             xml.RequestAction('Rate')
-            xml.RequestOption('Shop')
-            # not implemented: 'Rate' RequestOption to specify a single service query
-            # xml.RequestOption((options[:service].nil? or options[:service] == :all) ? 'Shop' : 'Rate')
+            xml.RequestOption((options[:service].nil?) ? 'Shop' : 'Rate')
           end
 
           pickup_type = options[:pickup_type] || :daily_pickup
@@ -282,6 +293,12 @@ module ActiveShipping
             #                   * Shipment/ScheduledDeliveryTime element
             #                   * Shipment/AlternateDeliveryTime element
             #                   * Shipment/DocumentsOnly element
+
+            unless options[:service].nil?
+              xml.Service do
+                xml.Code(options[:service])
+              end
+            end
 
             Array(packages).each do |package|
               options[:imperial] ||= IMPERIAL_COUNTRIES.include?(origin.country_code(:alpha2))
@@ -387,6 +404,20 @@ module ActiveShipping
                   end
                 end
               end
+            elsif options[:bill_third_party]
+              xml.PaymentInformation do
+                xml.BillThirdParty do
+                  xml.BillThirdPartyShipper do
+                    xml.AccountNumber(options[:billing_account])
+                    xml.ThirdParty do
+                      xml.Address do
+                        xml.PostalCode(options[:billing_zip])
+                        xml.CountryCode(options[:billing_country])
+                      end
+                    end
+                  end
+                end
+              end
             else
               xml.ItemizedPaymentInformation do
                 xml.ShipmentCharge do
@@ -453,15 +484,27 @@ module ActiveShipping
             end
           end
 
-          # I don't know all of the options that UPS supports for labels
-          # so I'm going with something very simple for now.
+          # Supported label formats:
+          # GIF, EPL, ZPL, STARPL and SPL
+          label_format = options[:label_format] ? options[:label_format].upcase : 'GIF'
+          label_size = options[:label_size] ? options[:label_size] : [4, 6]
+
           xml.LabelSpecification do
-            xml.LabelPrintMethod do
-              xml.Code('GIF')
+            xml.LabelStockSize do
+              xml.Height(label_size[0])
+              xml.Width(label_size[1])
             end
-            xml.HTTPUserAgent('Mozilla/4.5') # hmmm
-            xml.LabelImageFormat('GIF') do
-              xml.Code('GIF')
+
+            xml.LabelPrintMethod do
+              xml.Code(label_format)
+            end
+
+            # API requires these only if returning a GIF formated label
+            if label_format == 'GIF'
+              xml.HTTPUserAgent('Mozilla/4.5')
+              xml.LabelImageFormat(label_format) do
+                xml.Code(label_format)
+              end
             end
           end
         end
@@ -488,15 +531,16 @@ module ActiveShipping
             value = packages.inject(0) do |sum, package|
               sum + (options[:imperial] ? package.lbs.to_f : package.kgs.to_f )
             end
-            value = (value * 1000).round/1000.0
 
-            xml.Weight([value, 0.1].max)
+            xml.Weight([value.round(3), 0.1].max)
           end
 
-          xml.InvoiceLineTotal do
-            xml.CurrencyCode('USD')
-            total_value = packages.inject(0) {|sum, package| sum + package.value}
-            xml.MonetaryValue(total_value)
+          if packages.any? {|package| package.value.present?}
+            xml.InvoiceLineTotal do
+              xml.CurrencyCode('USD')
+              total_value = packages.inject(0) {|sum, package| sum + package.value.to_i}
+              xml.MonetaryValue(total_value)
+            end
           end
 
           xml.PickupDate(pickup_date.strftime('%Y%m%d'))
@@ -564,11 +608,13 @@ module ActiveShipping
     def build_tracking_request(tracking_number, options = {})
       xml_builder = Nokogiri::XML::Builder.new do |xml|
         xml.TrackRequest do
+          xml.TrackingOption(options[:tracking_option]) if options[:tracking_option]
           xml.Request do
             xml.RequestAction('Track')
             xml.RequestOption('1')
           end
           xml.TrackingNumber(tracking_number.to_s)
+          xml.TrackingOption('03') if options[:mail_innovations]
         end
       end
       xml_builder.to_xml
@@ -656,11 +702,19 @@ module ActiveShipping
         end
 
         xml.PackageWeight do
+          if (options[:service] || options[:service_code]) == DEFAULT_SERVICE_NAME_TO_CODE["UPS SurePost (USPS) < 1lb"]
+            # SurePost < 1lb uses OZS, not LBS
+            code = options[:imperial] ? 'OZS' : 'KGS'
+            weight = options[:imperial] ? package.oz : package.kgs
+          else
+            code = options[:imperial] ? 'LBS' : 'KGS'
+            weight = options[:imperial] ? package.lbs : package.kgs
+          end
           xml.UnitOfMeasurement do
-            xml.Code(options[:imperial] ? 'LBS' : 'KGS')
+            xml.Code(code)
           end
 
-          value = ((options[:imperial] ? package.lbs : package.kgs).to_f * 1000).round / 1000.0 # 3 decimals
+          value = ((weight).to_f * 1000).round / 1000.0 # 3 decimals
           xml.Weight([value, 0.1].max)
         end
 
@@ -676,6 +730,24 @@ module ActiveShipping
           if delivery_confirmation = package.options[:delivery_confirmation]
             xml.DeliveryConfirmation do
               xml.DCISType(PACKAGE_DELIVERY_CONFIRMATION_CODES[delivery_confirmation])
+            end
+          end
+
+          if dry_ice = package.options[:dry_ice]
+            xml.DryIce do
+              xml.RegulationSet(dry_ice[:regulation_set] || 'CFR')
+              xml.DryIceWeight do
+                xml.UnitOfMeasurement do
+                  xml.Code(options[:imperial] ? 'LBS' : 'KGS')
+                end
+                # Cannot be more than package weight.
+                # Should be more than 0.0.
+                # Valid characters are 0-9 and .(Decimal point).
+                # Limit to 1 digit after the decimal. The maximum length
+                # of the field is 5 including . and can hold up
+                # to 1 decimal place.
+                xml.Weight(dry_ice[:weight])
+              end
             end
           end
         end
@@ -770,9 +842,10 @@ module ActiveShipping
         unless activities.empty?
           shipment_events = activities.map do |activity|
             description = activity.at('Status/StatusType/Description').text
+            type_code = activity.at('Status/StatusType/Code').text
             zoneless_time = parse_ups_datetime(:time => activity.at('Time'), :date => activity.at('Date'))
             location = location_from_address_node(activity.at('ActivityLocation/Address'))
-            ShipmentEvent.new(description, zoneless_time, location)
+            ShipmentEvent.new(description, zoneless_time, location, nil, type_code)
           end
 
           shipment_events = shipment_events.sort_by(&:time)
@@ -782,7 +855,7 @@ module ActiveShipping
           # This adds an origin event to the shipment activity in such cases.
           if origin && !(shipment_events.count == 1 && status == :delivered)
             first_event = shipment_events[0]
-            origin_event = ShipmentEvent.new(first_event.name, first_event.time, origin)
+            origin_event = ShipmentEvent.new(first_event.name, first_event.time, origin, first_event.message, first_event.type_code)
 
             if within_same_area?(origin, first_event.location)
               shipment_events[0] = origin_event
@@ -801,7 +874,7 @@ module ActiveShipping
             unless destination
               destination = shipment_events[-1].location
             end
-            shipment_events[-1] = ShipmentEvent.new(shipment_events.last.name, shipment_events.last.time, destination)
+            shipment_events[-1] = ShipmentEvent.new(shipment_events.last.name, shipment_events.last.time, destination, shipment_events.last.message, shipment_events.last.type_code)
           end
         end
 
@@ -837,11 +910,13 @@ module ActiveShipping
           service_name = service_summary.at('Service/Description').text
           service_code = UPS::DEFAULT_SERVICE_NAME_TO_CODE[service_name]
           date = Date.strptime(service_summary.at('EstimatedArrival/Date').text, '%Y-%m-%d')
+          business_transit_days = service_summary.at('EstimatedArrival/BusinessTransitDays').text.to_i
           delivery_estimates << DeliveryDateEstimate.new(origin, destination, self.class.class_variable_get(:@@name),
                                     service_name,
                                     :service_code => service_code,
                                     :guaranteed => service_summary.at('Guaranteed/Code').text == 'Y',
-                                    :date =>  date)
+                                    :date =>  date,
+                                    :business_transit_days => business_transit_days)
         end
       end
       response = DeliveryDateEstimatesResponse.new(success, message, Hash.from_xml(response).values.first, :delivery_estimates => delivery_estimates, :xml => response, :request => last_request)
@@ -860,8 +935,10 @@ module ActiveShipping
 
     def location_from_address_node(address)
       return nil unless address
+      country = address.at('CountryCode').try(:text)
+      country = 'US' if country == 'ZZ' # Sometimes returned by SUREPOST in the US
       Location.new(
-        :country     => address.at('CountryCode').try(:text),
+        :country     => country,
         :postal_code => address.at('PostalCode').try(:text),
         :province    => address.at('StateProvinceCode').try(:text),
         :city        => address.at('City').try(:text),
@@ -910,7 +987,7 @@ module ActiveShipping
       packages = response_info["ShipmentResults"]["PackageResults"]
       packages = [packages] if Hash === packages
       labels = packages.map do |package|
-        Label.new(package["TrackingNumber"], package["LabelImage"]["GraphicImage"])
+        Label.new(package["TrackingNumber"], Base64.decode64(package["LabelImage"]["GraphicImage"]))
       end
 
       LabelResponse.new(success, message, response_info, {labels: labels})

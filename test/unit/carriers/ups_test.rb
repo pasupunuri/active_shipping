@@ -21,6 +21,12 @@ class UPSTest < Minitest::Test
     assert UPS.new(:login => 'blah', :password => 'bloo', :key => 'kee')
   end
 
+  def test_find_tracking_info_should_create_correct_xml
+    xml_request = xml_fixture('ups/access_request') + xml_fixture('ups/tracking_request')
+    @carrier.expects(:commit).with(:track, xml_request, true).returns(@tracking_response)
+    @carrier.find_tracking_info('1Z5FX0076803466397', :tracking_option => '03', :test => true)
+  end
+
   def test_find_tracking_info_should_return_a_tracking_response
     @carrier.expects(:commit).returns(@tracking_response)
     assert_equal 'ActiveShipping::TrackingResponse', @carrier.find_tracking_info('1Z5FX0076803466397').class.name
@@ -120,6 +126,12 @@ class UPSTest < Minitest::Test
                   "ARRIVAL SCAN",
                   "OUT FOR DELIVERY",
                   "DELIVERED"], response.shipment_events.map(&:name)
+  end
+
+  def test_find_tracking_info_should_have_correct_type_codes_for_shipment_events
+    @carrier.expects(:commit).returns(@tracking_response)
+    response = @carrier.find_tracking_info('1Z5FX0076803466397')
+    assert_equal ["M", "I", "I", "I", "I", "I", "I", "D"], response.shipment_events.map(&:type_code)
   end
 
   def test_add_origin_and_destination_data_to_shipment_events_where_appropriate
@@ -265,7 +277,7 @@ class UPSTest < Minitest::Test
     assert_includes tracking, "1ZA03R691592132475"
     assert_includes tracking, "1ZA03R691590470881"
 
-    pictures = response.labels.map { |label| label.base64_img_data }
+    pictures = response.labels.map { |label| label.img_data }
     refute_includes pictures, nil
   end
 
@@ -296,7 +308,7 @@ class UPSTest < Minitest::Test
     tracking = response.labels.map { |label| label.tracking_number }
     assert_includes tracking, "1ZA03R691591538440"
 
-    pictures = response.labels.map { |label| label.base64_img_data }
+    pictures = response.labels.map { |label| label.img_data }
     refute_includes pictures, nil
   end
 
@@ -324,6 +336,25 @@ class UPSTest < Minitest::Test
 
     prepay = response.search '/ShipmentConfirmRequest/Shipment/PaymentInformation/Prepaid'
     refute_empty prepay
+  end
+
+  def test_label_request_bill_third_party
+    expected_account_number = "A01B24"
+    expected_postal_code_number = "97013"
+    expected_country_code = "US"
+    response = Nokogiri::XML @carrier.send(:build_shipment_request,
+                                           location_fixtures[:beverly_hills],
+                                           location_fixtures[:annapolis],
+                                           package_fixtures.values_at(:chocolate_stuff),
+                                           :test => true,
+                                           :bill_third_party => true,
+                                           :billing_account => expected_account_number,
+                                           :billing_zip => expected_postal_code_number,
+                                           :billing_country => expected_country_code)
+
+    assert_equal expected_account_number, response.search('ShipmentConfirmRequest/Shipment/PaymentInformation/BillThirdParty/BillThirdPartyShipper/AccountNumber').text
+    assert_equal expected_postal_code_number, response.search('/ShipmentConfirmRequest/Shipment/PaymentInformation/BillThirdParty/BillThirdPartyShipper/ThirdParty/Address/PostalCode').text
+    assert_equal expected_country_code, response.search('/ShipmentConfirmRequest/Shipment/PaymentInformation/BillThirdParty/BillThirdPartyShipper/ThirdParty/Address/CountryCode').text
   end
 
   def test_label_request_negotiated_rates_presence
@@ -460,6 +491,7 @@ class UPSTest < Minitest::Test
     assert_equal 6, response.delivery_estimates.size
     ground_estimate = response.delivery_estimates.select{ |de| de.service_name == "UPS Ground"}.first
     assert_equal Date.parse('2015-02-5'), ground_estimate.date
+    assert_equal 3, ground_estimate.business_transit_days
   end
 
   def test_get_delivery_date_estimates_can_translate_service_codes
@@ -484,10 +516,64 @@ class UPSTest < Minitest::Test
     end
   end
 
+<<<<<<< HEAD
+=======
+  def test_get_rates_for_single_serivce
+    mock_response = xml_fixture("ups/rate_single_service")
+    @carrier.expects(:commit).returns(mock_response)
+
+    response = @carrier.find_rates(
+      location_fixtures[:new_york_with_name],
+      location_fixtures[:real_home_as_residential],
+      package_fixtures.values_at(:books),
+      {
+        :service => UPS::DEFAULT_SERVICE_NAME_TO_CODE["UPS Ground"],
+        :test => true
+      }
+    )
+    assert_equal ["UPS Ground"], response.rates.map(&:service_name)
+  end
+
   def test_void_shipment
     mock_response = xml_fixture("ups/void_shipment_response")
     @carrier.expects(:commit).returns(mock_response)
     response = @carrier.void_shipment('1Z12345E0390817264')
     assert response
+  end
+
+  def test_maximum_address_field_length
+    assert_equal 35, @carrier.maximum_address_field_length
+  end
+
+  def test_package_surepost_less_than_one_lb_service
+    xml_builder = Nokogiri::XML::Builder.new do |xml|
+      @carrier.send(:build_package_node,
+                    xml,
+                    package_fixtures[:small_half_pound],
+                    {
+                      :service => "92",
+                      :imperial => true
+                    }
+      )
+    end
+    request = Nokogiri::XML(xml_builder.to_xml)
+    assert_equal 'OZS', request.search('/Package/PackageWeight/UnitOfMeasurement/Code').text
+    assert_equal '8.0', request.search('/Package/PackageWeight/Weight').text
+  end
+
+  def test_package_surepost_less_than_one_lb_service_code
+    xml_builder = Nokogiri::XML::Builder.new do |xml|
+      @carrier.send(:build_package_node,
+                    xml,
+                    package_fixtures[:small_half_pound],
+                    {
+                      :service_code => "92",
+                      :imperial => true
+                    }
+      )
+    end
+    request = Nokogiri::XML(xml_builder.to_xml)
+    assert_equal 'OZS', request.search('/Package/PackageWeight/UnitOfMeasurement/Code').text
+    assert_equal '8.0', request.search('/Package/PackageWeight/Weight').text
   end
 end
