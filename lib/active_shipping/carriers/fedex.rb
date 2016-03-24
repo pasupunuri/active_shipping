@@ -163,30 +163,27 @@ module ActiveShipping
 
 
     # Get Shipping labels
-    # Caveats:
-    #  - Only supports singlular packages
-    #
     def create_shipment(origin, destination, packages, options = {})
       options = @options.merge(options)
       packages = Array(packages)
+      raise Error, "Multiple packages are not supported yet." if packages.length > 1
 
-      begin
-        request = build_shipment_request(origin, destination, packages, options)
-        logger.debug(request) if logger
+      request = build_shipment_request(origin, destination, packages, options)
+      logger.debug(request) if logger
 
-        logger.debug(confirm_response) if logger
+      response = commit(save_request(request), (options[:test] || false))
+      parse_ship_response(response)
+    end
 
-        response = commit(save_request(request), (options[:test] || false))
-        parse_ship_response(response)
-      rescue RuntimeError => e
-        raise "Could not obtain shipping label. #{e.message}."
-      end
+    def maximum_address_field_length
+      # See Fedex Developper Guide
+      35
     end
 
     protected
 
     def build_shipment_request(origin, destination, packages, options = {})
-      imperial = %w(US LR MM).include?(origin.country_code(:alpha2))
+      imperial = location_uses_imperial(origin)
 
       xml_builder = Nokogiri::XML::Builder.new do |xml|
         xml.ProcessShipmentRequest(xmlns: 'http://fedex.com/ws/ship/v13') do
@@ -287,7 +284,7 @@ module ActiveShipping
     end
 
     def build_rate_request(origin, destination, packages, options = {})
-      imperial = %w(US LR MM).include?(origin.country_code(:alpha2))
+      imperial = location_uses_imperial(origin)
 
       xml_builder = Nokogiri::XML::Builder.new do |xml|
         xml.RateRequest(xmlns: 'http://fedex.com/ws/rate/v13') do
@@ -477,31 +474,45 @@ module ActiveShipping
       message = response_message(xml)
 
       if success
+        missing_xml_field = false
         rate_estimates = xml.root.css('> RateReplyDetails').map do |rated_shipment|
-          service_code = rated_shipment.at('ServiceType').text
-          is_saturday_delivery = rated_shipment.at('AppliedOptions').try(:text) == 'SATURDAY_DELIVERY'
-          is_home_delivery = service_code == "GROUND_HOME_DELIVERY"
-          service_type = is_saturday_delivery ? "#{service_code}_SATURDAY_DELIVERY" : service_code
+          begin
+            service_code = rated_shipment.at('ServiceType').text
 
-          transit_time = rated_shipment.at('TransitTime').try(:text)
-          max_transit_time = rated_shipment.at('MaximumTransitTime').try(:text)
+            is_saturday_delivery = rated_shipment.at('AppliedOptions').try(:text) == 'SATURDAY_DELIVERY'
+            is_home_delivery = service_code == "GROUND_HOME_DELIVERY"
+            service_type = is_saturday_delivery ? "#{service_code}_SATURDAY_DELIVERY" : service_code
 
-          delivery_timestamp = rated_shipment.at('DeliveryTimestamp').try(:text)
-          delivery_range = delivery_range_from(transit_time, max_transit_time, delivery_timestamp, is_home_delivery, options)
+            transit_time = rated_shipment.at('TransitTime').text if ["FEDEX_GROUND", "GROUND_HOME_DELIVERY"].include?(service_code)
+            max_transit_time = rated_shipment.at('MaximumTransitTime').try(:text) if service_code == "FEDEX_GROUND"
 
-          currency = rated_shipment.at('RatedShipmentDetails/ShipmentRateDetail/TotalNetCharge/Currency').text
-          RateEstimate.new(origin, destination, @@name,
-               self.class.service_name_for_code(service_type),
-               :service_code => service_code,
-               :total_price => rated_shipment.at('RatedShipmentDetails/ShipmentRateDetail/TotalNetCharge/Amount').text.to_f,
-               :currency => currency,
-               :packages => packages,
-               :delivery_range => delivery_range)
+            delivery_timestamp = rated_shipment.at('DeliveryTimestamp').try(:text)
+            delivery_range = delivery_range_from(transit_time, max_transit_time, delivery_timestamp, is_home_delivery, options)
+
+            currency = rated_shipment.at('RatedShipmentDetails/ShipmentRateDetail/TotalNetCharge/Currency').text
+            RateEstimate.new(origin, destination, @@name,
+                 self.class.service_name_for_code(service_type),
+                 :service_code => service_code,
+                 :total_price => rated_shipment.at('RatedShipmentDetails/ShipmentRateDetail/TotalNetCharge/Amount').text.to_f,
+                 :currency => currency,
+                 :packages => packages,
+                 :delivery_range => delivery_range)
+          rescue NoMethodError
+            missing_xml_field = true
+            nil
+          end
         end
+
+        rate_estimates = rate_estimates.compact
+        logger.warn("[FedexParseRateError] Some fields where missing in the response: #{response}") if logger && missing_xml_field
 
         if rate_estimates.empty?
           success = false
-          message = "No shipping rates could be found for the destination address" if message.blank?
+          if missing_xml_field
+            message = "The response from the carrier contained errors and could not be treated"
+          else
+            message = "No shipping rates could be found for the destination address" if message.blank?
+          end
         end
       else
         rate_estimates = []
@@ -533,7 +544,7 @@ module ActiveShipping
       tracking_number = xml.css("CompletedPackageDetails TrackingIds TrackingNumber").text
       base_64_image = xml.css("Label Image").text
 
-      labels = [Label.new(tracking_number, base_64_image)]
+      labels = [Label.new(tracking_number, Base64.decode64(base_64_image))]
       LabelResponse.new(success, message, response_info, {labels: labels})
     end
 
@@ -592,7 +603,12 @@ module ActiveShipping
           when '9040'
             raise ActiveShipping::ShipmentNotFound, first_notification.at('Message').text
           else
-            raise ActiveShipping::ResponseContentError, first_notification.at('Message').text
+            raise ActiveShipping::ResponseContentError, StandardError.new(first_notification.at('Message').text)
+          end
+        elsif first_notification.at('Severity').text == 'FAILURE'
+          case first_notification.at('Code').text
+          when '9045'
+            raise ActiveShipping::ResponseContentError, StandardError.new(first_notification.at('Message').text)
           end
         end
 
@@ -602,7 +618,11 @@ module ActiveShipping
           raise ActiveShipping::Error, "Tracking response does not contain status information"
         end
 
-        status_code = status_detail.at('Code').text
+        status_code = status_detail.at('Code').try(:text)
+        if status_code.nil?
+          raise ActiveShipping::Error, "Tracking response does not contain status code"
+        end
+
         status_description = (status_detail.at('AncillaryDetails/ReasonDescription') || status_detail.at('Description')).text
         status = TRACKING_STATUS_CODES[status_code]
 
@@ -636,11 +656,12 @@ module ActiveShipping
 
           location = Location.new(:city => city, :state => state, :postal_code => zip_code, :country => country)
           description = event.at('EventDescription').text
+          type_code = event.at('EventType').text
 
           time          = Time.parse(event.at('Timestamp').text)
           zoneless_time = time.utc
 
-          shipment_events << ShipmentEvent.new(description, zoneless_time, location)
+          shipment_events << ShipmentEvent.new(description, zoneless_time, location, description, type_code)
         end
         shipment_events = shipment_events.sort_by(&:time)
 
@@ -703,23 +724,19 @@ module ActiveShipping
 
     def extract_address(document, possible_node_names)
       node = nil
+      args = {}
       possible_node_names.each do |name|
         node = document.at(name)
         break if node
       end
 
-      args = if node && node.at('CountryCode')
-        {
-          :country => node.at('CountryCode').text,
-          :province => node.at('StateOrProvinceCode').text,
-          :city => node.at('City').text
-        }
-      else
-        {
-          :country => ActiveUtils::Country.new(:alpha2 => 'ZZ', :name => 'Unknown or Invalid Territory', :alpha3 => 'ZZZ', :numeric => '999'),
-          :province => 'unknown',
-          :city => 'unknown'
-        }
+      if node
+        args[:country] =
+          node.at('CountryCode').try(:text) ||
+          ActiveUtils::Country.new(:alpha2 => 'ZZ', :name => 'Unknown or Invalid Territory', :alpha3 => 'ZZZ', :numeric => '999')
+
+        args[:province] = node.at('StateOrProvinceCode').try(:text) || 'unknown'
+        args[:city] = node.at('City').try(:text) || 'unknown'
       end
 
       Location.new(args)
@@ -744,6 +761,10 @@ module ActiveShipping
       document
     rescue Nokogiri::XML::SyntaxError => e
       raise ActiveShipping::ResponseContentError.new(e, xml)
+    end
+
+    def location_uses_imperial(location)
+      %w(US LR MM).include?(location.country_code(:alpha2))
     end
   end
 end

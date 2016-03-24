@@ -14,18 +14,20 @@ Gem::Specification.new do |s|
   s.description = "Get rates and tracking info from various shipping carriers. Extracted from Shopify."
   s.license     = 'MIT'
 
-  s.add_dependency('quantified',    '~> 1.0')
+  s.add_dependency('quantified',    '~> 1.0.1')
   s.add_dependency('activesupport', '>= 3.2', '< 5.0.0')
-  s.add_dependency('active_utils',  '~> 3.0.0')
+  s.add_dependency('active_utils',  '~> 3.2.0')
   s.add_dependency('nokogiri',      '>= 1.6')
 
   s.add_development_dependency('minitest')
   s.add_development_dependency('rake')
   s.add_development_dependency('mocha', '~> 1')
   s.add_development_dependency('timecop')
+  s.add_development_dependency('business_time')
+  s.add_development_dependency('pry')
 
   s.files        = `git ls-files`.split($/)
   s.executables  = s.files.grep(%r{^bin/}).map{ |f| File.basename(f) }
   s.test_files   = s.files.grep(%r{^(test|spec|features)/})
-  s.require_path = ['lib']
+  s.require_path = 'lib'
 end
